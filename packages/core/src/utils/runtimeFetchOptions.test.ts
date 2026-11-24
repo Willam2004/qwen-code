@@ -65,6 +65,7 @@ vi.mock('undici', () => {
 import {
   buildRuntimeFetchOptions,
   extractHostnameFromProxyUrl,
+  getMcpDispatcherResetCount,
   getOrCreateMcpDispatcher,
   getOrCreateSharedDispatcher,
   isTlsVerificationDisabled,
@@ -72,6 +73,7 @@ import {
   redactProxyCredentials,
   redactProxyError,
   resetDispatcherCache,
+  resetMcpDispatcher,
   setResolvedProxyUrlForRuntimeFetch,
 } from './runtimeFetchOptions.js';
 
@@ -627,5 +629,42 @@ describe('requireUndici guard', () => {
     expect(() =>
       fresh.getOrCreateSharedDispatcher('http://proxy.local'),
     ).toThrow(/undici is not loaded yet; await preloadRuntimeFetchModule\(\)/);
+  });
+});
+
+describe('resetMcpDispatcher (DAT-2687)', () => {
+  beforeEach(() => {
+    resetDispatcherCache();
+  });
+
+  it('replaces the cached MCP agent so a reconnect dials on a new identity', () => {
+    const before = getOrCreateMcpDispatcher(false);
+    const resetsBefore = getMcpDispatcherResetCount();
+
+    expect(resetMcpDispatcher()).toEqual({ reset: true });
+
+    const after = getOrCreateMcpDispatcher(false);
+    expect(after).not.toBe(before);
+    expect(getMcpDispatcherResetCount()).toBe(resetsBefore + 1);
+  });
+
+  it('reports no work when nothing is cached', () => {
+    expect(resetMcpDispatcher()).toEqual({ reset: false });
+  });
+
+  it('keeps the explicit proxy URL and refuses to destroy the LLM-shared agent', () => {
+    setResolvedProxyUrlForRuntimeFetch('http://proxy.local:8080');
+    const shared = getOrCreateMcpDispatcher(false);
+    // MCP deliberately shares the LLM dispatcher when a proxy is configured.
+    expect(getOrCreateSharedDispatcher('http://proxy.local:8080', false)).toBe(
+      shared,
+    );
+
+    expect(resetMcpDispatcher()).toEqual({
+      reset: false,
+      reason: 'shared_with_llm_dispatcher',
+    });
+    // The shared agent (and the configured proxy URL) survive the refused reset.
+    expect(getOrCreateMcpDispatcher(false)).toBe(shared);
   });
 });

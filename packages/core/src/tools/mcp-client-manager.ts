@@ -12,9 +12,12 @@ import {
   MCPDiscoveryState,
   MCPServerStatus,
   attemptAutomaticMcpOAuth,
+  getMCPServerLastError,
   getMCPServerStatus,
   populateMcpServerCommand,
   probeMcpServerForOAuth,
+  recordMCPServerAttempt,
+  recordMCPServerLastError,
   removeMCPServerStatus,
   setMCPDiscoveryState,
 } from './mcp-client.js';
@@ -43,6 +46,12 @@ import {
 import { listDescendantPids, sigtermPids } from './pid-descendants.js';
 import { mcpSessionMetadataKey } from './mcp-session-config.js';
 import { runWithTimeout } from './mcp-discovery-timeout.js';
+import {
+  DEFAULT_MCP_CONNECT_RETRY_POLICY,
+  mcpConnectRetryDelayMs,
+  shouldRetryMcpConnect,
+  type McpConnectRetryPolicy,
+} from './mcp-retry.js';
 import { warnOnUnmatchedEagerToolEntries } from '../permissions/eager-allowlist-coverage.js';
 import { warnOnUnmatchedDisabledToolEntries } from '../permissions/disabled-tools-coverage.js';
 
@@ -378,6 +387,13 @@ export interface McpClientManagerOptions {
   healthConfig?: Partial<MCPHealthMonitorConfig>;
   budgetConfig?: McpBudgetConfig;
   pool?: import('./mcp-transport-pool.js').McpTransportPool;
+  /**
+   * Bounded connect-level retry for servers that failed at discovery.
+   * Defaults to {@link DEFAULT_MCP_CONNECT_RETRY_POLICY} and is only active
+   * when `pool` is set (the served process); the legacy single-session path
+   * keeps its historical behaviour.
+   */
+  connectRetry?: Partial<McpConnectRetryPolicy>;
 }
 
 /**
@@ -397,6 +413,21 @@ export class McpClientManager {
   private consecutiveFailures: Map<string, number> = new Map();
   private isReconnecting: Map<string, boolean> = new Map();
   private serverDiscoveryPromises: Map<string, Promise<void>> = new Map();
+
+  /**
+   * Bounded connect-level retry (pool/served mode only). A server whose
+   * discovery acquire failed — or whose pooled transport dropped — is retried
+   * with exponential backoff instead of waiting for the next session or a
+   * container rebuild. Timers are per server, cleared on success, on explicit
+   * disconnect, and on `stop()`.
+   */
+  private readonly connectRetryPolicy: McpConnectRetryPolicy;
+  private retryTimers: Map<string, NodeJS.Timeout> = new Map();
+  private retryAttempts: Map<string, number> = new Map();
+  private retryNextAt: Map<string, number> = new Map();
+  private retryInFlight: Set<string> = new Set();
+  /** Servers whose retry budget is spent; surfaced through `mcpHealth`. */
+  private retryExhausted: Set<string> = new Set();
 
   /**
    * Per connected server, the single-session "connected config key" of the
@@ -573,6 +604,16 @@ export class McpClientManager {
     this.eventEmitter = options.eventEmitter;
     this.sendSdkMcpMessage = options.sendSdkMcpMessage;
     this.healthConfig = { ...DEFAULT_HEALTH_CONFIG, ...options.healthConfig };
+    // Connect-level retry belongs to the served process: it exists so a
+    // long-lived daemon heals a failed MCP server in place. Legacy
+    // single-session invocations keep their historical "try once per session"
+    // behaviour, so the policy is force-disabled without a pool.
+    this.connectRetryPolicy = {
+      ...DEFAULT_MCP_CONNECT_RETRY_POLICY,
+      ...options.connectRetry,
+      enabled:
+        (options.connectRetry?.enabled ?? true) && this.pool !== undefined,
+    };
     const budgetConfig = options.budgetConfig;
 
     // Tests inject `budgetConfig` directly; production reads env vars
@@ -1638,6 +1679,8 @@ export class McpClientManager {
             );
           }
           this.pooledConnections.delete(name);
+          // Removed / disabled servers must not keep a retry timer alive.
+          if (desired === undefined) this.clearServerRetry(name);
         }
       }
       const acquirePromises = Object.entries(servers).map(
@@ -1689,6 +1732,18 @@ export class McpClientManager {
                 `Pool metadata refresh failed for ${name}: ${getErrorMessage(err)}`,
               );
             }
+            // A surviving connection that is actually live means a connect
+            // succeeded; any retry armed for an older incarnation is obsolete.
+            // A survivor that is NOT connected (half-dead entry) must keep its
+            // retry loop running instead of silently losing it here.
+            const survivorStatus = (
+              existingConnection as {
+                client?: { getStatus?: () => MCPServerStatus };
+              }
+            ).client?.getStatus?.();
+            if (survivorStatus === MCPServerStatus.CONNECTED) {
+              this.clearServerRetry(name);
+            }
             return;
           }
           try {
@@ -1726,6 +1781,18 @@ export class McpClientManager {
                 this.pooledConnections.delete(name);
               }
               conn.off('event', onFailed);
+              // The entry is terminal and the pool evicted it, so this
+              // session lost the server's tools. Arm the bounded retry
+              // instead of waiting for the next discovery pass.
+              recordMCPServerLastError(
+                name,
+                e.lastError ?? 'transport disconnected',
+              );
+              this.scheduleServerRetry(
+                name,
+                e.lastError ?? 'transport dropped',
+                'transport_dropped',
+              );
             };
             conn.on('event', onFailed);
             // skip
@@ -1747,6 +1814,9 @@ export class McpClientManager {
               return;
             }
             this.pooledConnections.set(name, conn);
+            // Fresh successful acquire supersedes any retry armed for an
+            // earlier failed incarnation.
+            this.clearServerRetry(name);
           } catch (err) {
             // Pool acquire failure for one server is non-fatal for
             // siblings (matches the legacy `discoverMcpToolsForServer`
@@ -1774,6 +1844,16 @@ export class McpClientManager {
               debugLogger.error(
                 `Pool acquire failed for ${name}: ${getErrorMessage(err)}`,
               );
+              // Failures that never reach `McpClient.connect()` (spawn or
+              // pre-spawn errors) still need a cause + attempt stamp, or the
+              // health surface would report "never attempted" for a server we
+              // are actively retrying.
+              recordMCPServerAttempt(name);
+              recordMCPServerLastError(name, getErrorMessage(err));
+              // Daemon self-heal: keep trying in the background with
+              // exponential backoff instead of stranding this server until
+              // the process is rebuilt (the DAT-2682 failure mode).
+              this.scheduleServerRetry(name, err, 'connect_failed');
             }
           }
         },
@@ -1812,6 +1892,9 @@ export class McpClientManager {
   async stop(): Promise<void> {
     // Stop all health checks first
     this.stopAllHealthChecks();
+    // Cancel any pending connect retry — a stopped manager must not wake up
+    // and re-acquire pool refs after `releaseAllPooledConnections()`.
+    this.clearAllServerRetries();
 
     // drain
     // the in-flight pool discovery pass BEFORE releasing pool refs.
@@ -1937,6 +2020,8 @@ export class McpClientManager {
   async disconnectServer(serverName: string): Promise<void> {
     // Stop health check for this server
     this.stopHealthCheck(serverName);
+    // An explicit disconnect cancels the self-heal loop for this server.
+    this.clearServerRetry(serverName);
 
     // release this server's pool reference if
     // we acquired one. Pool starts drain timer at refs=0; entry will
@@ -2150,6 +2235,150 @@ export class McpClientManager {
     } finally {
       this.isReconnecting.set(serverName, false);
     }
+  }
+
+  /**
+   * Public view of the bounded connect retry for one server, consumed by the
+   * workspace status route's `mcpHealth` cell.
+   */
+  getMcpRetryState(serverName: string): {
+    attempts: number;
+    nextRetryAt?: number;
+    exhausted: boolean;
+    inFlight: boolean;
+  } {
+    const nextRetryAt = this.retryNextAt.get(serverName);
+    return {
+      attempts: this.retryAttempts.get(serverName) ?? 0,
+      ...(nextRetryAt === undefined ? {} : { nextRetryAt }),
+      exhausted: this.retryExhausted.has(serverName),
+      inFlight: this.retryInFlight.has(serverName),
+    };
+  }
+
+  /** Drop any pending connect retry for one server. */
+  private clearServerRetry(serverName: string): void {
+    const timer = this.retryTimers.get(serverName);
+    if (timer) clearTimeout(timer);
+    this.retryTimers.delete(serverName);
+    this.retryAttempts.delete(serverName);
+    this.retryNextAt.delete(serverName);
+    this.retryExhausted.delete(serverName);
+  }
+
+  private clearAllServerRetries(): void {
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    this.retryTimers.clear();
+    this.retryAttempts.clear();
+    this.retryNextAt.clear();
+    this.retryExhausted.clear();
+    this.retryInFlight.clear();
+  }
+
+  /**
+   * Arm the next bounded connect retry for a server that failed at discovery,
+   * whose pooled transport dropped, or whose retry pass failed again.
+   *
+   * Skips (rather than queues) when a retry is already scheduled or the retry
+   * pass itself is in flight: the in-flight pass re-arms when it settles, so
+   * there is exactly one timer per server.
+   */
+  private scheduleServerRetry(
+    serverName: string,
+    failure: unknown,
+    reason: 'connect_failed' | 'transport_dropped' | 'retry_failed',
+  ): void {
+    if (!this.connectRetryPolicy.enabled) return;
+    if (this.retryTimers.has(serverName)) return;
+    if (this.retryInFlight.has(serverName)) return;
+    // A fresh failure nobody has classified yet gets one classification pass;
+    // an already-armed loop (transport drop / failed retry) keeps going, since
+    // its original cause already passed the same gate.
+    if (reason === 'connect_failed' && !shouldRetryMcpConnect(failure)) {
+      debugLogger.debug(
+        `MCP server '${serverName}' failed with a permanent cause; ` +
+          `not scheduling a connect retry: ${getErrorMessage(failure)}`,
+      );
+      return;
+    }
+    const attempts = (this.retryAttempts.get(serverName) ?? 0) + 1;
+    if (attempts > this.connectRetryPolicy.maxAttempts) {
+      this.retryExhausted.add(serverName);
+      this.retryNextAt.delete(serverName);
+      debugLogger.warn(
+        `MCP server '${serverName}' still failing after ` +
+          `${this.connectRetryPolicy.maxAttempts} connect retries; stopping ` +
+          `until the next discovery or an operator restart. ` +
+          `Last error: ${getErrorMessage(failure)}`,
+      );
+      return;
+    }
+    this.retryAttempts.set(serverName, attempts);
+    const delayMs = mcpConnectRetryDelayMs(this.connectRetryPolicy, attempts);
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(serverName);
+      this.retryNextAt.delete(serverName);
+      void this.runServerRetry(serverName, reason);
+    }, delayMs);
+    // Never keep the process alive just for a retry timer.
+    timer.unref?.();
+    this.retryTimers.set(serverName, timer);
+    this.retryNextAt.set(serverName, Date.now() + delayMs);
+    debugLogger.info(
+      `MCP server '${serverName}' ${reason === 'transport_dropped' ? 'dropped' : 'failed'}; ` +
+        `retry ${attempts}/${this.connectRetryPolicy.maxAttempts} in ${delayMs}ms: ` +
+        `${getErrorMessage(failure)}`,
+    );
+  }
+
+  /**
+   * One retry hop: re-run the pool discovery pass. That pass only acquires
+   * servers the manager does not already hold, and a successful acquire
+   * attaches this session's view — so the recovered server's tools land back
+   * in this session's registry without restarting the serve process.
+   */
+  private async runServerRetry(
+    serverName: string,
+    reason: 'connect_failed' | 'transport_dropped' | 'retry_failed',
+  ): Promise<void> {
+    if (!this.pool) return;
+    const serverConfig = this.getEffectiveMcpServers()[serverName];
+    if (
+      !serverConfig ||
+      this.cliConfig.isMcpServerDisabled?.(serverName) ||
+      this.cliConfig.isMcpServerPendingApproval?.(serverName)
+    ) {
+      this.clearServerRetry(serverName);
+      return;
+    }
+    const attemptsBefore = this.retryAttempts.get(serverName) ?? 0;
+    this.retryInFlight.add(serverName);
+    try {
+      await this.discoverAllMcpToolsViaPool(this.cliConfig);
+    } catch (err) {
+      // The per-server acquire catch already logged the cause and decided
+      // whether this server is worth another hop; a rejection here only means
+      // the pass itself could not finish.
+      debugLogger.debug(
+        `MCP connect retry pass for '${serverName}' rejected: ${getErrorMessage(err)}`,
+      );
+    } finally {
+      this.retryInFlight.delete(serverName);
+    }
+    if (this.getServerStatus(serverName) === MCPServerStatus.CONNECTED) {
+      if (this.retryTimers.has(serverName)) return;
+      this.clearServerRetry(serverName);
+      debugLogger.info(
+        `MCP server '${serverName}' recovered after ${attemptsBefore} connect ` +
+          `retr${attemptsBefore === 1 ? 'y' : 'ies'}; tools are registered again.`,
+      );
+      return;
+    }
+    this.scheduleServerRetry(
+      serverName,
+      getMCPServerLastError(serverName) ?? `still not connected (${reason})`,
+      'retry_failed',
+    );
   }
 
   /**

@@ -961,6 +961,10 @@ export class McpTransportPool {
       this.opts.workspaceContext,
       this.opts.debugMode,
       this.opts.sendSdkMcpMessage,
+      // Pool mode surfaces an unexpected transport close so a dead child
+      // flips the entry to 'failed' and the manager's bounded retry can heal
+      // it in place. Legacy single-session clients keep the old behaviour.
+      true,
     );
 
     //
@@ -1166,6 +1170,9 @@ export class McpTransportPool {
       this.opts.workspaceContext,
       this.opts.debugMode,
       this.opts.sendSdkMcpMessage,
+      // Same durability as the pooled spawn: an unpooled pool-managed
+      // transport that dies silently must flip to DISCONNECTED, not lie.
+      true,
     );
 
     // Build a SessionMcpView that wraps this session's registries.

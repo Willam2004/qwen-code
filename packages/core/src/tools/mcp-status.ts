@@ -52,6 +52,51 @@ export function getMCPServerLastError(serverName: string): string | undefined {
 }
 
 /**
+ * Epoch-ms of the most recent connect attempt per server, written when the
+ * attempt starts. The status enum alone cannot distinguish "never attempted"
+ * (disabled, budget-refused, pending approval) from "attempted and failed",
+ * and daemon operators cannot afford to grep logs for that. Kept next to
+ * `serverLastErrors` because both answer the same question: why is this
+ * server not CONNECTED, and when did we last try?
+ */
+const serverLastAttempts: Map<string, number> = new Map();
+
+/**
+ * Health view of one server, for status surfaces that must decide whether the
+ * serve process needs rebuilding instead of waiting for a user report.
+ */
+export interface MCPServerHealth {
+  status: MCPServerStatus;
+  /** Most recent failure cause; cleared once the server reaches CONNECTED. */
+  lastError?: string;
+  /** Start time (epoch ms) of the most recent connect attempt. */
+  lastAttemptAt?: number;
+}
+
+/**
+ * Mark the start of a connect attempt for a server. Called from
+ * `McpClient.connect()` so the legacy single-session path, the workspace
+ * transport pool, and manual restarts all feed the same record.
+ */
+export function recordMCPServerAttempt(
+  serverName: string,
+  at: number = Date.now(),
+): void {
+  serverLastAttempts.set(serverName, at);
+}
+
+/** Snapshot one server's health (status + last cause + last attempt time). */
+export function getMCPServerHealth(serverName: string): MCPServerHealth {
+  const lastError = serverLastErrors.get(serverName);
+  const lastAttemptAt = serverLastAttempts.get(serverName);
+  return {
+    status: getMCPServerStatus(serverName),
+    ...(lastError === undefined ? {} : { lastError }),
+    ...(lastAttemptAt === undefined ? {} : { lastAttemptAt }),
+  };
+}
+
+/**
  * Event listeners for MCP server status changes.
  * `status` is `undefined` when the server has been removed from the registry
  * (e.g. disabled via `/mcp`), so consumers can drop it from their snapshots
@@ -112,6 +157,7 @@ export function updateMCPServerStatus(
  */
 export function removeMCPServerStatus(serverName: string): void {
   serverLastErrors.delete(serverName);
+  serverLastAttempts.delete(serverName);
   if (!serverStatuses.has(serverName)) {
     return;
   }

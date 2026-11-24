@@ -395,10 +395,33 @@ export type ServeMcpTransport =
   | 'sdk'
   | 'unknown';
 
+/**
+ * Self-heal cell for one MCP server. Answers the two questions a control
+ * plane asks before deciding to rebuild a serve process: "is it connected
+ * right now?" and "when did we last try, and why did that fail?".
+ * `retryAttempts` / `nextRetryAt` / `retryExhausted` describe the bounded
+ * auto-retry loop the served process runs in place.
+ */
+export interface ServeMcpServerHealthCell {
+  connected: boolean;
+  /** Most recent connect/discovery failure; cleared on the next success. */
+  lastError?: string;
+  /** Epoch-ms of the most recent connect attempt (successful or not). */
+  lastAttemptAt?: number;
+  /** Connect retries already spent since the last success/removal. */
+  retryAttempts?: number;
+  /** Epoch-ms of the next scheduled connect retry, when one is armed. */
+  nextRetryAt?: number;
+  /** Retry budget spent; recovery now needs a reload or restart. */
+  retryExhausted?: boolean;
+}
+
 export interface ServeWorkspaceMcpServerStatus extends ServeStatusCell {
   kind: 'mcp_server';
   name: string;
   mcpStatus?: ServeMcpServerRuntimeStatus;
+  /** Health + self-heal detail; absent on older daemons. */
+  mcpHealth?: ServeMcpServerHealthCell;
   transport: ServeMcpTransport;
   disabled: boolean;
   hasOAuthTokens?: boolean;
@@ -541,6 +564,13 @@ export interface ServeWorkspaceMcpStatus {
    * daemons. A future version may add a `scope: 'pool'` cell alongside.
    */
   budgets?: ServeMcpBudgetStatusCell[];
+  /**
+   * How many times this process has replaced the MCP transport dispatcher —
+   * a restart/reload drops it so the reconnect dials on a fresh undici agent.
+   * Lets a control plane verify that a restart really picked up a new
+   * connection identity instead of reusing stale sockets.
+   */
+  mcpDispatcherResetCount?: number;
 }
 
 export interface ServeWorkspaceMcpToolStatus {

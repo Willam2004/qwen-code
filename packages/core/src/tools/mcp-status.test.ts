@@ -6,8 +6,10 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  getMCPServerHealth,
   getMCPServerLastError,
   MCPServerStatus,
+  recordMCPServerAttempt,
   recordMCPServerLastError,
   removeMCPServerStatus,
   updateMCPServerStatus,
@@ -57,5 +59,52 @@ describe('mcp-status last-error carrier (issue #9944)', () => {
     recordMCPServerLastError(serverName, 'spawn ENOENT');
     removeMCPServerStatus(serverName);
     expect(getMCPServerLastError(serverName)).toBeUndefined();
+  });
+});
+
+describe('mcp-status health view (DAT-2687)', () => {
+  const serverName = 'health-view-server';
+
+  afterEach(() => {
+    removeMCPServerStatus(serverName);
+  });
+
+  it('reports disconnected with no attempt before anything happened', () => {
+    expect(getMCPServerHealth(serverName)).toEqual({
+      status: MCPServerStatus.DISCONNECTED,
+    });
+  });
+
+  it('carries the last attempt time alongside the failure cause', () => {
+    recordMCPServerAttempt(serverName, 1_700_000_000_000);
+    recordMCPServerLastError(serverName, 'failed to start: aliyuncs-openapi');
+    updateMCPServerStatus(serverName, MCPServerStatus.DISCONNECTED);
+
+    expect(getMCPServerHealth(serverName)).toEqual({
+      status: MCPServerStatus.DISCONNECTED,
+      lastError: 'failed to start: aliyuncs-openapi',
+      lastAttemptAt: 1_700_000_000_000,
+    });
+  });
+
+  it('keeps lastAttemptAt but drops lastError after recovery', () => {
+    recordMCPServerAttempt(serverName, 1_700_000_000_000);
+    recordMCPServerLastError(serverName, 'spawn ENOENT');
+    updateMCPServerStatus(serverName, MCPServerStatus.CONNECTED);
+
+    expect(getMCPServerHealth(serverName)).toEqual({
+      status: MCPServerStatus.CONNECTED,
+      lastAttemptAt: 1_700_000_000_000,
+    });
+  });
+
+  it('drops the attempt record when the server is removed', () => {
+    recordMCPServerAttempt(serverName, 1_700_000_000_000);
+    recordMCPServerLastError(serverName, 'spawn ENOENT');
+    removeMCPServerStatus(serverName);
+
+    expect(getMCPServerHealth(serverName)).toEqual({
+      status: MCPServerStatus.DISCONNECTED,
+    });
   });
 });

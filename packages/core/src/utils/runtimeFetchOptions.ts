@@ -352,6 +352,78 @@ export function resetDispatcherCache(): void {
 }
 
 /**
+ * Number of times {@link resetMcpDispatcher} actually replaced the MCP
+ * dispatcher. Operators (and the restart/reload response path) use it to prove
+ * a reconnect really picked up a fresh connection identity instead of reusing
+ * sockets from a dead undici agent.
+ */
+let mcpDispatcherResetCount = 0;
+
+/** How many times the MCP dispatcher has been replaced in this process. */
+export function getMcpDispatcherResetCount(): number {
+  return mcpDispatcherResetCount;
+}
+
+export interface ResetMcpDispatcherResult {
+  /** `true` when the cached MCP agent was dropped and will be rebuilt. */
+  reset: boolean;
+  /**
+   * Why the reset was refused. `shared_with_llm_dispatcher` means an explicit
+   * `--proxy`/settings proxy is configured and MCP deliberately shares the
+   * LLM dispatcher — destroying it would abort in-flight model requests.
+   */
+  reason?: 'shared_with_llm_dispatcher';
+}
+
+/**
+ * Controlled reset of the MCP-owned undici dispatcher(s).
+ *
+ * The served process keeps MCP transports on a module-level cached agent for
+ * the life of the process (see {@link getOrCreateMcpDispatcher}). That agent
+ * owns a keep-alive socket pool; when a remote MCP endpoint goes away and
+ * comes back, a reconnect that reuses the same agent can keep handing back
+ * sockets from the dead pool and fail forever. Dropping the agent here makes
+ * the next dial build a new one, which is what
+ * `POST /workspace/mcp/:server/restart` and `POST /workspace/mcp/reload` need
+ * in order to "really" reconnect.
+ *
+ * Deliberately narrower than {@link resetDispatcherCache} (test-only):
+ *  - it keeps the explicitly configured proxy URL, so a daemon reload does
+ *    not silently downgrade `--proxy` to env-only proxy resolution;
+ *  - it never touches a dispatcher shared with the LLM path.
+ */
+export function resetMcpDispatcher(): ResetMcpDispatcherResult {
+  if (resolvedProxyUrlForRuntimeFetch) {
+    return { reset: false, reason: 'shared_with_llm_dispatcher' };
+  }
+  let resetAny = false;
+  for (const key of ['__env_proxy__', '__env_proxy__#insecure']) {
+    const dispatcher = dispatcherCache.get(key);
+    if (!dispatcher) continue;
+    dispatcherCache.delete(key);
+    resetAny = true;
+    try {
+      // Force-drop keep-alive sockets: a graceful `close()` would wait for
+      // them, which is exactly the "stale connection identity" this reset
+      // exists to escape (and would leak the agent until the idle timeout).
+      (dispatcher as unknown as { destroy?: (err?: Error) => Promise<void> })
+        .destroy?.(new Error('MCP dispatcher reset'))
+        ?.catch?.(() => {
+          // Sockets already gone; nothing to surface.
+        });
+    } catch {
+      // Best-effort: a dispatcher we cannot destroy is still evicted from the
+      // cache, and its sockets die with it.
+    }
+  }
+  if (resetAny) {
+    proxyFailureCounts.clear();
+    mcpDispatcherResetCount += 1;
+  }
+  return { reset: resetAny };
+}
+
+/**
  * Extract hostname (with port) from a proxy URL for deduplication.
  *
  * This function extracts just the host part from a proxy URL, removing any

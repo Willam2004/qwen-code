@@ -784,6 +784,7 @@ export * from './utils/retry.js';
 export * from './utils/ripgrepUtils.js';
 export {
   detectRuntime,
+  getMcpDispatcherResetCount,
   getOrCreateSharedDispatcher,
   isTlsVerificationDisabled,
   preloadRuntimeFetchModule,

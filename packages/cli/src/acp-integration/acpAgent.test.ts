@@ -821,6 +821,20 @@ vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => ({
   ).skillRestrictionNames,
   getMCPDiscoveryState: vi.fn().mockReturnValue('completed'),
   getMCPServerStatus: vi.fn().mockReturnValue('connected'),
+  // Real implementations: the workspace MCP status reads the process-wide
+  // health registry (lastError / lastAttemptAt), and MCP restart/reload reset
+  // the cached dispatcher. Omitting either export here would throw at the
+  // call and empty the whole `servers` list — the same failure mode the
+  // skills helpers above document.
+  getMCPServerHealth: (
+    await importOriginal<typeof import('@qwen-code/qwen-code-core')>()
+  ).getMCPServerHealth,
+  getMcpDispatcherResetCount: (
+    await importOriginal<typeof import('@qwen-code/qwen-code-core')>()
+  ).getMcpDispatcherResetCount,
+  resetMcpTransportDispatcher: (
+    await importOriginal<typeof import('@qwen-code/qwen-code-core')>()
+  ).resetMcpTransportDispatcher,
   MCPServerConfig: vi.fn().mockImplementation((...args: unknown[]) => ({
     _args: args,
   })),

@@ -36,20 +36,24 @@ import type { McpToolAnnotations } from './mcp-tool.js';
 import { SdkControlClientTransport } from './sdk-control-client-transport.js';
 import {
   MCPServerStatus,
+  recordMCPServerAttempt,
   recordMCPServerLastError,
   updateMCPServerStatus,
 } from './mcp-status.js';
 export {
   addMCPStatusChangeListener,
   getAllMCPServerStatuses,
+  getMCPServerHealth,
   getMCPServerLastError,
   getMCPServerStatus,
   MCPServerStatus,
+  recordMCPServerAttempt,
   recordMCPServerLastError,
   removeMCPServerStatus,
   removeMCPStatusChangeListener,
   updateMCPServerStatus,
 } from './mcp-status.js';
+export type { MCPServerHealth } from './mcp-status.js';
 
 import type { FunctionDeclaration } from '@google/genai';
 import { existsSync } from 'node:fs';
@@ -71,6 +75,7 @@ import {
   loadUndici,
   preloadRuntimeFetchModule,
   resetDispatcherCache,
+  resetMcpDispatcher,
 } from '../utils/runtimeFetchOptions.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
 import {
@@ -411,6 +416,34 @@ export function _resetMcpFetchDispatcherForTest(): void {
   resetDispatcherCache();
 }
 
+/**
+ * Production entry point for dropping the MCP transport's cached undici
+ * dispatcher. A served process caches that agent for its whole lifetime, so a
+ * restart/reload that reconnects without this call can keep reusing sockets
+ * from a dead pool — the daemon looks "reloaded" while the MCP server stays
+ * unreachable until the process is rebuilt.
+ *
+ * Safe on the legacy single-session path too: nothing calls it implicitly
+ * there, so default behaviour is unchanged.
+ *
+ * @returns `true` when a dispatcher was actually replaced.
+ */
+export function resetMcpTransportDispatcher(reason?: string): boolean {
+  const result = resetMcpDispatcher();
+  if (result.reset) {
+    debugLogger.info(
+      `MCP dispatcher reset (${reason ?? 'manual'}); ` +
+        `reconnect will dial on a fresh undici agent.`,
+    );
+  } else {
+    debugLogger.debug(
+      `MCP dispatcher reset skipped (${reason ?? 'manual'}): ` +
+        `${result.reason ?? 'no cached dispatcher'}.`,
+    );
+  }
+  return result.reset;
+}
+
 function createMcpStreamableHttpFetch(
   mcpServerName: string,
   mcpServerConfig: MCPServerConfig,
@@ -576,6 +609,16 @@ export class McpClient {
     private readonly workspaceContext: WorkspaceContext,
     private readonly debugMode: boolean,
     private readonly sendSdkMcpMessage?: SendSdkMcpMessage,
+    /**
+     * Pool mode only: mark the server DISCONNECTED when the transport closes
+     * without an error callback (a stdio child that exits, a remote stream
+     * that ends). The SDK rejects pending requests in that case but never
+     * calls `onerror`, so a shared pool entry would keep reporting CONNECTED
+     * and the manager's bounded retry would never arm — the server stayed
+     * dead until the serve process was rebuilt. Off by default so the legacy
+     * single-session path keeps its historical behaviour.
+     */
+    private readonly surfaceTransportClose: boolean = false,
   ) {
     this.client = createMcpClient(
       `qwen-cli-mcp-client-${this.serverName}`,
@@ -596,6 +639,10 @@ export class McpClient {
     // synthetic marker — but a stale error from a previous incarnation
     // would mis-attribute a fresh transport drop to an old cause.
     this.lastTransportError = undefined;
+    // Stamp the attempt before any transport work: status surfaces need
+    // "when did we last try" even when `createTransport()` or the handshake
+    // throws before a status write lands (a hung child, a DNS failure).
+    recordMCPServerAttempt(this.serverName);
     this.updateStatus(MCPServerStatus.CONNECTING);
     try {
       this.transport = await this.createTransport();
@@ -624,6 +671,28 @@ export class McpClient {
         );
         this.updateStatus(MCPServerStatus.DISCONNECTED);
       };
+
+      if (this.surfaceTransportClose) {
+        // A transport can also die WITHOUT an error callback: a stdio child
+        // that exits, or a remote stream that ends. Everything in flight
+        // rejects, but nothing writes DISCONNECTED — the pooled entry would
+        // keep reporting CONNECTED and the manager's bounded retry would
+        // never arm. Intentional teardown sets `isDisconnecting` first, and
+        // `updateStatus` suppresses writes in that window, so this only fires
+        // for genuinely unexpected closes.
+        this.client.onclose = () => {
+          if (this.isDisconnecting) return;
+          if (this.status === MCPServerStatus.DISCONNECTED) return;
+          this.lastTransportError ??= new Error(
+            'transport closed unexpectedly',
+          );
+          debugLogger.warn(
+            `MCP transport for '${this.serverName}' closed unexpectedly; ` +
+              `marking DISCONNECTED so the retry loop can heal it.`,
+          );
+          this.updateStatus(MCPServerStatus.DISCONNECTED);
+        };
+      }
 
       this.client.registerCapabilities({
         roots: {},

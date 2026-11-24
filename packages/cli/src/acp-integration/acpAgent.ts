@@ -57,7 +57,10 @@ import {
   readAgentTrace,
   tokenLimit,
   getMCPDiscoveryState,
+  getMCPServerHealth,
   getMCPServerStatus,
+  getMcpDispatcherResetCount,
+  resetMcpTransportDispatcher,
   initializeTelemetry,
   preloadContentGenerator,
   MCPDiscoveryState,
@@ -470,6 +473,7 @@ import {
   type ServeSessionTasksStatus,
   type ServeStatus,
   type ServeStatusCell,
+  type ServeMcpServerHealthCell,
   type ServeWorkspaceMcpServerStatus,
   type ServeWorkspaceMcpStatus,
   type ServeWorkspaceProviderModel,
@@ -8009,6 +8013,57 @@ class QwenAgent implements Agent {
     }
   }
 
+  /**
+   * Compose the per-server `mcpHealth` cell: live connectivity + last failure
+   * cause + last attempt time (process-wide registry, fed by every connect
+   * path), plus the manager's bounded retry bookkeeping when this Config owns
+   * one. Only pool/multi-session configs run the retry loop, so the legacy
+   * single-session cell carries just status/error/attempt.
+   */
+  private buildMcpHealthCell(
+    serverName: string,
+    rawStatus: MCPServerStatus,
+    manager:
+      | {
+          getMcpRetryState?: (name: string) => {
+            attempts: number;
+            nextRetryAt?: number;
+            exhausted: boolean;
+          };
+        }
+      | undefined,
+  ): ServeMcpServerHealthCell {
+    const health = getMCPServerHealth(serverName);
+    const retry = manager?.getMcpRetryState?.(serverName);
+    return {
+      connected: rawStatus === MCPServerStatus.CONNECTED,
+      ...(health.lastError === undefined
+        ? {}
+        : { lastError: health.lastError }),
+      ...(health.lastAttemptAt === undefined
+        ? {}
+        : { lastAttemptAt: health.lastAttemptAt }),
+      ...(retry === undefined || retry.attempts === 0
+        ? {}
+        : { retryAttempts: retry.attempts }),
+      ...(retry?.nextRetryAt === undefined
+        ? {}
+        : { nextRetryAt: retry.nextRetryAt }),
+      ...(retry?.exhausted ? { retryExhausted: true } : {}),
+    };
+  }
+
+  /**
+   * Whether an operator restart of this server should drop the cached MCP
+   * dispatcher first. Only HTTP-family transports ride the shared undici
+   * agent; resetting it for a stdio/websocket restart would merely abort other
+   * servers' keep-alive sockets.
+   */
+  private restartNeedsDispatcherReset(server: MCPServerConfig): boolean {
+    const transport = this.mcpTransport(server);
+    return transport === 'http' || transport === 'sse';
+  }
+
   private mcpCellStatus(
     status: MCPServerStatus,
     disabled: boolean,
@@ -8135,11 +8190,27 @@ class QwenAgent implements Agent {
       const sharedTokenStorage =
         scope === 'workspace' ? new MCPOAuthTokenStorage() : undefined;
 
+      // Health/self-heal source: the process-wide status registry (last
+      // failure + last attempt, fed by every connect path) plus the manager's
+      // bounded retry bookkeeping. Optional-chained for fixtures that omit
+      // either side.
+      const healthManager = (() => {
+        try {
+          return config.getToolRegistry()?.getMcpClientManager();
+        } catch {
+          return undefined;
+        }
+      })();
+
       return {
         v: STATUS_SCHEMA_VERSION,
         workspaceCwd,
         initialized: true,
         discoveryState: this.discoveryState(config),
+        // Proof for "did that restart really swap the connection identity?":
+        // a restart/reload that drops the cached MCP dispatcher increments
+        // this, so a control plane can tell a real reconnect from a no-op.
+        mcpDispatcherResetCount: getMcpDispatcherResetCount(),
         servers: await Promise.all(
           Object.entries(servers).map(async ([name, server]) => {
             const disabled = config.isMcpServerDisabled(name);
@@ -8185,6 +8256,11 @@ class QwenAgent implements Agent {
                 : this.mcpCellStatus(rawStatus, disabled),
               name,
               mcpStatus: this.mcpStatus(rawStatus),
+              mcpHealth: this.buildMcpHealthCell(
+                name,
+                rawStatus,
+                healthManager,
+              ),
               transport: this.mcpTransport(server),
               disabled,
               ...(hasOAuthTokens !== undefined ? { hasOAuthTokens } : {}),
@@ -11961,6 +12037,14 @@ class QwenAgent implements Agent {
           poolSnapshot !== undefined &&
           (poolSnapshot.byName[serverName]?.entryCount ?? 0) > 0;
         if (this.mcpPool && poolHasEntries) {
+          // Drop the cached MCP dispatcher before re-dialling. Without this
+          // the restart reuses keep-alive sockets from the dead connection,
+          // so the entry can come back "restarted" while still unreachable.
+          // Only HTTP-family transports ride that dispatcher; resetting it
+          // for a stdio restart would only abort other servers' sockets.
+          if (this.restartNeedsDispatcherReset(server)) {
+            resetMcpTransportDispatcher(`restart:${serverName}`);
+          }
           const restartResults = await this.mcpPool.restartByName(serverName, {
             ...(entryIndex !== undefined ? { entryIndex } : {}),
           });
@@ -11993,6 +12077,11 @@ class QwenAgent implements Agent {
           );
         }
         const start = Date.now();
+        // Same stale-socket problem as the pool branch: a legacy reconnect
+        // must not inherit the previous connection's agent.
+        if (this.restartNeedsDispatcherReset(server)) {
+          resetMcpTransportDispatcher(`restart:${serverName}`);
+        }
         await this.reconcileMcpServerAcrossLiveConfigs(serverName, 'discover');
         const disconnectedRuntime = this.getLiveMcpConfigs(serverName).find(
           (liveConfig) =>
@@ -12055,6 +12144,9 @@ class QwenAgent implements Agent {
             'forceReconnectAll and forceReconnectWhich cannot be used together',
           );
         }
+        // A reload that reconnects must not carry the pre-reload dispatcher
+        // (proxy/TLS state + keep-alive sockets) into the new connections.
+        resetMcpTransportDispatcher('reload');
         return this.reloadWorkspaceMcpDiscovery({
           forceReconnectAll: forceReconnectAll === true,
           forceReconnectWhich: forceReconnectWhich as string[] | undefined,

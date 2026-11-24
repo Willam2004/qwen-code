@@ -131,6 +131,73 @@ export async function retryWithBackoff<T>(
   throw lastError;
 }
 
+/**
+ * Policy for the served process's *connect-level* retry loop: a server whose
+ * initial connect/discovery failed is retried in the background instead of
+ * waiting for the next session or a container rebuild.
+ */
+export interface McpConnectRetryPolicy {
+  enabled: boolean;
+  /** Total attempts AFTER the initial one (so 5 = initial + 5 retries). */
+  maxAttempts: number;
+  /** First retry delay; doubles per attempt. */
+  baseDelayMs: number;
+  /** Ceiling for the exponential delay. */
+  maxDelayMs: number;
+}
+
+/**
+ * Bounded by design: an MCP endpoint that is down for a maintenance window
+ * recovers, while a permanently misconfigured server costs a handful of
+ * attempts instead of a retry storm for the life of the process.
+ */
+export const DEFAULT_MCP_CONNECT_RETRY_POLICY: McpConnectRetryPolicy = {
+  enabled: true,
+  maxAttempts: 5,
+  baseDelayMs: 2_000,
+  maxDelayMs: 60_000,
+};
+
+/** Delay before retry `attempt` (1-based), exponential with a hard ceiling. */
+export function mcpConnectRetryDelayMs(
+  policy: McpConnectRetryPolicy,
+  attempt: number,
+): number {
+  const exponent = Math.max(0, attempt - 1);
+  return Math.min(
+    policy.baseDelayMs * Math.pow(2, exponent),
+    policy.maxDelayMs,
+  );
+}
+
+/**
+ * Failures that will not be fixed by waiting. Everything else is retried —
+ * the incident this loop exists for ("failed to start: aliyuncs-openapi")
+ * surfaces as an opaque startup error that no retry classifier could prove
+ * permanent, and the loop is bounded, so a wrong "retryable" verdict costs a
+ * few attempts rather than unbounded load.
+ */
+const PERMANENT_MCP_CONNECT_PATTERNS: RegExp[] = [
+  /\b(401|403)\b(?!\d)/, // HTTP auth/forbidden, not a port number
+  /\bunauthorized\b/i,
+  /\bforbidden\b/i,
+  /\boauth\b/i,
+  /\bauthentication (?:required|failed)\b/i,
+  /\binvalid[ _-]?api[ _-]?key\b/i,
+  /\bbudget\b/i,
+  /\bpending approval\b/i,
+  /\bnot configured\b/i,
+];
+
+/** Whether a failed connect/discovery is worth a bounded connect-level retry. */
+export function shouldRetryMcpConnect(error: unknown): boolean {
+  if (error == null) return false;
+  const status = (error as { status?: unknown }).status;
+  if (status === 401 || status === 403) return false;
+  const message = getErrorMessage(error);
+  return !PERMANENT_MCP_CONNECT_PATTERNS.some((re) => re.test(message));
+}
+
 function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
